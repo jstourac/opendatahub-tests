@@ -5,6 +5,8 @@ Tests that Notebook CRs can be managed by Kueue queue system.
 
 import time
 from datetime import datetime, timezone
+from dataclasses import dataclass
+from typing import Any
 import pytest
 from simple_logger.logger import get_logger
 from kubernetes.dynamic import DynamicClient
@@ -27,23 +29,92 @@ pytestmark = [
     pytest.mark.smoke,
 ]
 
-# Test constants
-NAMESPACE_NAME = "kueue-notebook-test"
-LOCAL_QUEUE_NAME = "notebook-local-queue"
-CLUSTER_QUEUE_NAME = "notebook-cluster-queue"
-RESOURCE_FLAVOR_NAME = "notebook-flavor"
-CPU_QUOTA = "4"
-MEMORY_QUOTA = "8Gi"
-NOTEBOOK_NAME = "test-kueue-notebook"
 
-# Constants for resource starvation test
-LOW_RESOURCE_NAMESPACE_NAME = "kueue-low-resource-test"
-LOW_RESOURCE_LOCAL_QUEUE_NAME = "low-resource-local-queue"
-LOW_RESOURCE_CLUSTER_QUEUE_NAME = "low-resource-cluster-queue"
-LOW_RESOURCE_FLAVOR_NAME = "low-resource-flavor"
-LOW_CPU_QUOTA = "100m"  # Very low CPU quota - 100m
-LOW_MEMORY_QUOTA = "64Mi"  # Very low memory quota
-HIGH_DEMAND_NOTEBOOK_NAME = "high-demand-notebook"
+@dataclass
+class TestConfig:
+    """Test configuration constants."""
+
+    # Normal resources scenario
+    NAMESPACE_NAME = "kueue-notebook-test"
+    LOCAL_QUEUE_NAME = "notebook-local-queue"
+    CLUSTER_QUEUE_NAME = "notebook-cluster-queue"
+    RESOURCE_FLAVOR_NAME = "notebook-flavor"
+    CPU_QUOTA = "4"
+    MEMORY_QUOTA = "8Gi"
+    NOTEBOOK_NAME = "test-kueue-notebook"
+
+    # Resource starvation scenario
+    LOW_RESOURCE_NAMESPACE_NAME = "kueue-low-resource-test"
+    LOW_RESOURCE_LOCAL_QUEUE_NAME = "low-resource-local-queue"
+    LOW_RESOURCE_CLUSTER_QUEUE_NAME = "low-resource-cluster-queue"
+    LOW_RESOURCE_FLAVOR_NAME = "low-resource-flavor"
+    LOW_CPU_QUOTA = "100m"  # Very low CPU quota - 100m
+    LOW_MEMORY_QUOTA = "64Mi"  # Very low memory quota
+    HIGH_DEMAND_NOTEBOOK_NAME = "high-demand-notebook"
+
+    # Expected resource usage for normal scenario
+    # Main notebook container: cpu="1", memory="1Gi"
+    # OAuth proxy sidecar: cpu="100m", memory="64Mi"
+    # Total: cpu="1100m", memory="1088Mi"
+    EXPECTED_CPU_NORMAL = "1100m"
+    EXPECTED_MEMORY_NORMAL = "1088Mi"
+
+
+def _create_normal_resources_config() -> dict[str, Any]:
+    """Create configuration for normal resources test scenario."""
+    return {
+        "patched_kueue_manager_config": {},
+        "kueue_enabled_notebook_namespace": {"name": TestConfig.NAMESPACE_NAME, "add-kueue-label": True},
+        "kueue_notebook_persistent_volume_claim": {"name": TestConfig.NOTEBOOK_NAME},
+        "default_notebook": {
+            "namespace": TestConfig.NAMESPACE_NAME,
+            "name": TestConfig.NOTEBOOK_NAME,
+            "labels": {"kueue.x-k8s.io/queue-name": TestConfig.LOCAL_QUEUE_NAME},
+        },
+        "kueue_notebook_cluster_queue": {
+            "name": TestConfig.CLUSTER_QUEUE_NAME,
+            "resource_flavor_name": TestConfig.RESOURCE_FLAVOR_NAME,
+            "cpu_quota": TestConfig.CPU_QUOTA,
+            "memory_quota": TestConfig.MEMORY_QUOTA,
+            "namespace_selector": {"matchLabels": {"kubernetes.io/metadata.name": TestConfig.NAMESPACE_NAME}},
+        },
+        "kueue_notebook_resource_flavor": {"name": TestConfig.RESOURCE_FLAVOR_NAME},
+        "kueue_notebook_local_queue": {
+            "name": TestConfig.LOCAL_QUEUE_NAME,
+            "cluster_queue": TestConfig.CLUSTER_QUEUE_NAME,
+        },
+    }
+
+
+def _create_resource_starvation_config() -> dict[str, Any]:
+    """Create configuration for resource starvation test scenario."""
+    return {
+        "patched_kueue_manager_config": {},
+        "kueue_enabled_notebook_namespace": {"name": TestConfig.LOW_RESOURCE_NAMESPACE_NAME, "add-kueue-label": True},
+        "kueue_notebook_persistent_volume_claim": {"name": TestConfig.HIGH_DEMAND_NOTEBOOK_NAME},
+        "default_notebook": {
+            "namespace": TestConfig.LOW_RESOURCE_NAMESPACE_NAME,
+            "name": TestConfig.HIGH_DEMAND_NOTEBOOK_NAME,
+            "labels": {"kueue.x-k8s.io/queue-name": TestConfig.LOW_RESOURCE_LOCAL_QUEUE_NAME},
+            # Request resources that exceed the queue limits
+            "cpu_request": "1000m",  # 1 CPU (exceeds 100m limit)
+            "memory_request": "1Gi",  # 1 GB (exceeds 64Mi limit)
+        },
+        "kueue_notebook_cluster_queue": {
+            "name": TestConfig.LOW_RESOURCE_CLUSTER_QUEUE_NAME,
+            "resource_flavor_name": TestConfig.LOW_RESOURCE_FLAVOR_NAME,
+            "cpu_quota": TestConfig.LOW_CPU_QUOTA,
+            "memory_quota": TestConfig.LOW_MEMORY_QUOTA,
+            "namespace_selector": {
+                "matchLabels": {"kubernetes.io/metadata.name": TestConfig.LOW_RESOURCE_NAMESPACE_NAME}
+            },
+        },
+        "kueue_notebook_resource_flavor": {"name": TestConfig.LOW_RESOURCE_FLAVOR_NAME},
+        "kueue_notebook_local_queue": {
+            "name": TestConfig.LOW_RESOURCE_LOCAL_QUEUE_NAME,
+            "cluster_queue": TestConfig.LOW_RESOURCE_CLUSTER_QUEUE_NAME,
+        },
+    }
 
 
 @pytest.mark.parametrize(
@@ -51,49 +122,11 @@ HIGH_DEMAND_NOTEBOOK_NAME = "high-demand-notebook"
     "default_notebook, kueue_notebook_cluster_queue, kueue_notebook_resource_flavor, kueue_notebook_local_queue",
     [
         pytest.param(
-            {},  # Uses default patching behavior for ConfigMap
-            {"name": NAMESPACE_NAME, "add-kueue-label": True},
-            {"name": NOTEBOOK_NAME},
-            {
-                "namespace": NAMESPACE_NAME,
-                "name": NOTEBOOK_NAME,
-                "labels": {"kueue.x-k8s.io/queue-name": LOCAL_QUEUE_NAME},
-            },
-            {
-                "name": CLUSTER_QUEUE_NAME,
-                "resource_flavor_name": RESOURCE_FLAVOR_NAME,
-                "cpu_quota": CPU_QUOTA,
-                "memory_quota": MEMORY_QUOTA,
-                "namespace_selector": {"matchLabels": {"kubernetes.io/metadata.name": NAMESPACE_NAME}},
-            },
-            {"name": RESOURCE_FLAVOR_NAME},
-            {"name": LOCAL_QUEUE_NAME, "cluster_queue": CLUSTER_QUEUE_NAME},
+            *_create_normal_resources_config().values(),
             id="normal_resources",
         ),
         pytest.param(
-            {},  # Uses default patching behavior for ConfigMap
-            {"name": LOW_RESOURCE_NAMESPACE_NAME, "add-kueue-label": True},
-            {"name": HIGH_DEMAND_NOTEBOOK_NAME},
-            {
-                "namespace": LOW_RESOURCE_NAMESPACE_NAME,
-                "name": HIGH_DEMAND_NOTEBOOK_NAME,
-                "labels": {"kueue.x-k8s.io/queue-name": LOW_RESOURCE_LOCAL_QUEUE_NAME},
-                # Request resources that exceed the queue limits
-                "cpu_request": "1000m",  # 1 CPU (exceeds 100m limit)
-                "memory_request": "1Gi",  # 1 GB (exceeds 64Mi limit)
-            },
-            {
-                "name": LOW_RESOURCE_CLUSTER_QUEUE_NAME,
-                "resource_flavor_name": LOW_RESOURCE_FLAVOR_NAME,
-                "cpu_quota": LOW_CPU_QUOTA,
-                "memory_quota": LOW_MEMORY_QUOTA,
-                "namespace_selector": {"matchLabels": {"kubernetes.io/metadata.name": LOW_RESOURCE_NAMESPACE_NAME}},
-            },
-            {"name": LOW_RESOURCE_FLAVOR_NAME},
-            {
-                "name": LOW_RESOURCE_LOCAL_QUEUE_NAME,
-                "cluster_queue": LOW_RESOURCE_CLUSTER_QUEUE_NAME,
-            },
+            *_create_resource_starvation_config().values(),
             id="resource_starvation",
         ),
     ],
@@ -111,6 +144,79 @@ class TestKueueNotebookController:
 
     This ensures proper isolation and cleanup between test runs.
     """
+
+    def _is_resource_starvation_scenario(self, notebook: Notebook) -> bool:
+        """Check if this is the resource starvation test scenario."""
+        return notebook.name == TestConfig.HIGH_DEMAND_NOTEBOOK_NAME
+
+    def _validate_notebook_kueue_labels(self, notebook: Notebook, expected_queue_name: str) -> None:
+        """Validate that notebook has proper Kueue labels."""
+        assert notebook.exists, "Notebook CR should be created successfully"
+        notebook_labels = notebook.instance.metadata.labels or {}
+        queue_name = notebook_labels.get("kueue.x-k8s.io/queue-name")
+        assert queue_name is not None, (
+            f"Notebook should have Kueue queue label. Available labels: {list(notebook_labels.keys())}"
+        )
+        assert queue_name == expected_queue_name, (
+            f"Notebook should have correct queue name: {expected_queue_name}, got: {queue_name}"
+        )
+
+    def _setup_and_wait_for_notebook_pod(self, notebook: Notebook, client: DynamicClient) -> Pod:
+        """Create notebook pod and wait for it to exist."""
+        notebook_pod = Pod(
+            client=client,
+            namespace=notebook.namespace,
+            name=f"{notebook.name}-0",
+        )
+        notebook_pod.wait(timeout=Timeout.TIMEOUT_2MIN)
+        return notebook_pod
+
+    def _validate_pod_kueue_management(self, pod: Pod, expected_queue_name: str) -> None:
+        """Validate that pod is properly managed by Kueue."""
+        pod_labels = pod.instance.metadata.labels or {}
+        assert pod_labels.get("kueue.x-k8s.io/managed") == "true", "Pod should be managed by Kueue"
+        assert pod_labels.get("kueue.x-k8s.io/queue-name") == expected_queue_name, "Pod should reference correct queue"
+
+    def _verify_resource_tracking(
+        self, cluster_queue, local_queue, flavor_name: str, expected_cpu: str, expected_memory: str
+    ) -> None:
+        """Verify that queues are tracking expected resource usage."""
+        cluster_usage = get_queue_resource_usage(queue=cluster_queue, flavor_name=flavor_name)
+        local_usage = get_queue_resource_usage(queue=local_queue, flavor_name=flavor_name)
+
+        LOGGER.info(f"ClusterQueue usage: {cluster_usage}")
+        LOGGER.info(f"LocalQueue usage: {local_usage}")
+
+        cluster_tracks_exact = verify_queue_tracks_workload(
+            queue=cluster_queue, flavor_name=flavor_name, expected_cpu=expected_cpu, expected_memory=expected_memory
+        )
+        local_tracks_exact = verify_queue_tracks_workload(
+            queue=local_queue, flavor_name=flavor_name, expected_cpu=expected_cpu, expected_memory=expected_memory
+        )
+
+        assert cluster_tracks_exact or local_tracks_exact, (
+            f"Either ClusterQueue or LocalQueue should show exact resource usage "
+            f"(CPU: {expected_cpu}, Memory: {expected_memory}). "
+            f"ClusterQueue usage: {cluster_usage}, LocalQueue usage: {local_usage}"
+        )
+
+    def _verify_pod_gating_status(
+        self,
+        pod_labels: list[str],
+        namespace: str,
+        admin_client: DynamicClient,
+        expected_running: int,
+        expected_gated: int,
+    ) -> None:
+        """Verify the gating status of pods."""
+        running_pods, gated_pods = check_gated_pods_and_running_pods(
+            labels=pod_labels, namespace=namespace, admin_client=admin_client
+        )
+
+        assert running_pods == expected_running, (
+            f"Expected exactly {expected_running} running notebook pods, found {running_pods}"
+        )
+        assert gated_pods == expected_gated, f"Expected {expected_gated} gated notebook pods, found {gated_pods}"
 
     def test_kueue_notebook_admission_control(
         self,
@@ -134,46 +240,20 @@ class TestKueueNotebookController:
         """
 
         # Skip this test for resource starvation scenario
-        if default_notebook.name == HIGH_DEMAND_NOTEBOOK_NAME:
+        if self._is_resource_starvation_scenario(default_notebook):
             pytest.skip("Skipping admission control test for resource starvation scenario")
 
         # Verify that the notebook was created with Kueue labels
-        assert default_notebook.exists, "Notebook CR should be created successfully"
-        notebook_labels = default_notebook.instance.metadata.labels or {}
-        queue_name = notebook_labels.get("kueue.x-k8s.io/queue-name")
-        assert queue_name is not None, (
-            f"Notebook should have Kueue queue label. Available labels: {list(notebook_labels.keys())}"
-        )
-        assert queue_name == LOCAL_QUEUE_NAME, (
-            f"Notebook should have correct queue name: {LOCAL_QUEUE_NAME}, got: {queue_name}"
-        )
+        self._validate_notebook_kueue_labels(default_notebook, TestConfig.LOCAL_QUEUE_NAME)
 
-        # Find the notebook pod
-        notebook_pod = Pod(
-            client=unprivileged_client,
-            namespace=default_notebook.namespace,
-            name=f"{default_notebook.name}-0",
-        )
-
-        # Wait for the pod to be created
-        notebook_pod.wait(timeout=Timeout.TIMEOUT_2MIN)
-
-        # Check Kueue admission control behavior
-        # The pod should initially be gated by Kueue, then allowed to run
-        pod_labels = [
-            f"app={default_notebook.name}",  # Notebook pods use the 'app' label
-        ]
+        # Find and wait for the notebook pod
+        notebook_pod = self._setup_and_wait_for_notebook_pod(default_notebook, unprivileged_client)
 
         # Verify that Kueue has admitted the workload and pod exists
-        # The pod may be in various states: Running, Pending (ContainerCreating), or initially Gated
         assert notebook_pod.exists, f"Notebook pod {notebook_pod.name} should exist"
 
-        # Check if the pod has Kueue management labels (proves Kueue is managing it)
-        notebook_pod_labels = notebook_pod.instance.metadata.labels or {}
-        assert notebook_pod_labels.get("kueue.x-k8s.io/managed") == "true", "Pod should be managed by Kueue"
-        assert notebook_pod_labels.get("kueue.x-k8s.io/queue-name") == LOCAL_QUEUE_NAME, (
-            "Pod should reference correct queue"
-        )
+        # Verify pod has Kueue management labels
+        self._validate_pod_kueue_management(notebook_pod, TestConfig.LOCAL_QUEUE_NAME)
 
         # Wait for the notebook pod to become ready
         notebook_pod.wait_for_condition(
@@ -181,51 +261,23 @@ class TestKueueNotebookController:
         )
 
         # Verify the pod is now running (not gated)
-        running_pods_final, gated_pods_final = check_gated_pods_and_running_pods(
-            labels=pod_labels, namespace=kueue_enabled_notebook_namespace.name, admin_client=admin_client
+        pod_labels = [f"app={default_notebook.name}"]
+        self._verify_pod_gating_status(
+            pod_labels=pod_labels,
+            namespace=kueue_enabled_notebook_namespace.name,
+            admin_client=admin_client,
+            expected_running=1,
+            expected_gated=0,
         )
 
-        assert running_pods_final == 1, f"Expected exactly 1 running notebook pod, found {running_pods_final}"
-        assert gated_pods_final == 0, f"Expected no gated notebook pods, found {gated_pods_final}"
-
-        # ADDITIONAL CHECK: Verify Kueue is tracking exact resource usage
-        # This proves that Kueue is actually managing the workload, not just adding labels
-        LOGGER.info(f"Checking ClusterQueue {kueue_notebook_cluster_queue.name} resource usage...")
-        cluster_queue_usage = get_queue_resource_usage(
-            queue=kueue_notebook_cluster_queue, flavor_name=RESOURCE_FLAVOR_NAME
-        )
-        LOGGER.info(f"ClusterQueue usage: {cluster_queue_usage}")
-
-        LOGGER.info(f"Checking LocalQueue {kueue_notebook_local_queue.name} resource usage...")
-        local_queue_usage = get_queue_resource_usage(queue=kueue_notebook_local_queue, flavor_name=RESOURCE_FLAVOR_NAME)
-        LOGGER.info(f"LocalQueue usage: {local_queue_usage}")
-
-        # Determine expected resource usage based on total pod requests
-        # For normal_resources scenario:
-        # - Main notebook container: cpu="1", memory="1Gi"
-        # - OAuth proxy sidecar: cpu="100m", memory="64Mi"
-        # - Total: cpu="1100m", memory="1088Mi"
-        expected_cpu = "1100m"
-        expected_memory = "1088Mi"
-
-        # Verify that either ClusterQueue or LocalQueue shows the exact expected resource usage
-        cluster_tracks_exact = verify_queue_tracks_workload(
-            queue=kueue_notebook_cluster_queue,
-            flavor_name=RESOURCE_FLAVOR_NAME,
-            expected_cpu=expected_cpu,
-            expected_memory=expected_memory,
-        )
-        local_tracks_exact = verify_queue_tracks_workload(
-            queue=kueue_notebook_local_queue,
-            flavor_name=RESOURCE_FLAVOR_NAME,
-            expected_cpu=expected_cpu,
-            expected_memory=expected_memory,
-        )
-
-        assert cluster_tracks_exact or local_tracks_exact, (
-            f"Either ClusterQueue or LocalQueue should show exact resource usage matching notebook requests "
-            f"(CPU: {expected_cpu}, Memory: {expected_memory}). "
-            f"ClusterQueue usage: {cluster_queue_usage}, LocalQueue usage: {local_queue_usage}"
+        # Verify Kueue is tracking exact resource usage
+        LOGGER.info(f"Checking queue resource usage for {kueue_notebook_cluster_queue.name}...")
+        self._verify_resource_tracking(
+            cluster_queue=kueue_notebook_cluster_queue,
+            local_queue=kueue_notebook_local_queue,
+            flavor_name=TestConfig.RESOURCE_FLAVOR_NAME,
+            expected_cpu=TestConfig.EXPECTED_CPU_NORMAL,
+            expected_memory=TestConfig.EXPECTED_MEMORY_NORMAL,
         )
 
     def test_kueue_notebook_resource_constraints(
@@ -248,33 +300,30 @@ class TestKueueNotebookController:
         """
 
         # Skip this test for resource starvation scenario
-        if default_notebook.name == HIGH_DEMAND_NOTEBOOK_NAME:
+        if self._is_resource_starvation_scenario(default_notebook):
             pytest.skip("Skipping resource constraints test for resource starvation scenario")
 
         # Verify notebook exists and has proper configuration
         assert default_notebook.exists, "Notebook CR should exist"
 
-        # Get the notebook pod
-        notebook_pod = Pod(
-            client=unprivileged_client,
-            namespace=default_notebook.namespace,
-            name=f"{default_notebook.name}-0",
-        )
-
-        # Wait for pod to be created and ready
-        notebook_pod.wait(timeout=Timeout.TIMEOUT_2MIN)
+        # Get the notebook pod and wait for it to be ready
+        notebook_pod = self._setup_and_wait_for_notebook_pod(default_notebook, unprivileged_client)
         notebook_pod.wait_for_condition(
             condition=Pod.Condition.READY, status=Pod.Condition.Status.TRUE, timeout=Timeout.TIMEOUT_5MIN
         )
 
         # Verify resource requests are properly set
-        pod_spec = notebook_pod.instance.spec
+        self._validate_notebook_resource_requests(notebook_pod, default_notebook)
+
+    def _validate_notebook_resource_requests(self, pod: Pod, notebook: Notebook) -> None:
+        """Validate that notebook container has proper resource requests."""
+        pod_spec = pod.instance.spec
         containers = pod_spec.containers
 
-        # Find the main notebook container (should be the first one)
+        # Find the main notebook container
         notebook_container = None
         for container in containers:
-            if container.name == default_notebook.name:
+            if container.name == notebook.name:
                 notebook_container = container
                 break
 
@@ -295,7 +344,9 @@ class TestKueueNotebookController:
         else:
             cpu_value = float(cpu_request)
 
-        assert cpu_value <= float(CPU_QUOTA), f"CPU request {cpu_value} should not exceed queue quota {CPU_QUOTA}"
+        assert cpu_value <= float(TestConfig.CPU_QUOTA), (
+            f"CPU request {cpu_value} should not exceed queue quota {TestConfig.CPU_QUOTA}"
+        )
 
         # Memory requests should be reasonable (basic validation)
         assert memory_request != "0", "Memory request should be specified"
@@ -322,62 +373,54 @@ class TestKueueNotebookController:
         """
 
         # Skip this test for normal resource scenario
-        if default_notebook.name != HIGH_DEMAND_NOTEBOOK_NAME:
+        if not self._is_resource_starvation_scenario(default_notebook):
             pytest.skip("Skipping resource starvation test for normal resource scenario")
 
         # Verify that the notebook was created with Kueue labels
-        assert default_notebook.exists, "High-demand Notebook CR should be created successfully"
-        notebook_labels = default_notebook.instance.metadata.labels or {}
-        queue_name = notebook_labels.get("kueue.x-k8s.io/queue-name")
-        assert queue_name is not None, (
-            f"Notebook should have Kueue queue label. Available labels: {list(notebook_labels.keys())}"
-        )
-        assert queue_name == LOW_RESOURCE_LOCAL_QUEUE_NAME, (
-            f"Notebook should have correct queue name: {LOW_RESOURCE_LOCAL_QUEUE_NAME}, got: {queue_name}"
-        )
+        self._validate_notebook_kueue_labels(default_notebook, TestConfig.LOW_RESOURCE_LOCAL_QUEUE_NAME)
 
         # Check that the notebook pod is created but gated due to insufficient resources
-        notebook_pod = Pod(
-            client=unprivileged_client,
-            namespace=default_notebook.namespace,
-            name=f"{default_notebook.name}-0",
-        )
-
-        # Wait for the pod to be created (but it should remain gated)
-        notebook_pod.wait(timeout=Timeout.TIMEOUT_2MIN)
+        notebook_pod = self._setup_and_wait_for_notebook_pod(default_notebook, unprivileged_client)
         assert notebook_pod.exists, f"Notebook pod {notebook_pod.name} should exist"
 
         # Verify that Kueue has applied management labels to the pod
-        notebook_pod_labels = notebook_pod.instance.metadata.labels or {}
-        assert notebook_pod_labels.get("kueue.x-k8s.io/managed") == "true", "Pod should be managed by Kueue"
-        assert notebook_pod_labels.get("kueue.x-k8s.io/queue-name") == LOW_RESOURCE_LOCAL_QUEUE_NAME, (
-            "Pod should reference correct queue"
+        self._validate_pod_kueue_management(notebook_pod, TestConfig.LOW_RESOURCE_LOCAL_QUEUE_NAME)
+
+        # Wait for pod to be properly gated
+        self._wait_for_pod_gating(notebook_pod)
+
+        # Verify pod is gated due to resource constraints
+        pod_labels = [f"app={default_notebook.name}"]
+        self._verify_pod_gating_status(
+            pod_labels=pod_labels,
+            namespace=kueue_enabled_notebook_namespace.name,
+            admin_client=admin_client,
+            expected_running=0,
+            expected_gated=1,
         )
 
-        # Define pod labels for the check function
-        pod_labels = [f"app={default_notebook.name}"]
+        # Verify the pod phase and conditions
+        self._verify_scheduling_gated_condition(notebook_pod)
 
-        # Wait for pod to be properly gated (check multiple times to ensure stable state)
+        LOGGER.info(
+            f"SUCCESS: Notebook pod {notebook_pod.name} is properly gated due to insufficient resources "
+            f"in queue {TestConfig.LOW_RESOURCE_LOCAL_QUEUE_NAME}"
+        )
+
+    def _wait_for_pod_gating(self, pod: Pod) -> None:
+        """Wait for pod to be properly gated (check multiple times to ensure stable state)."""
         for _ in range(10):
-            notebook_pod.get()  # Refresh pod state
-            if notebook_pod.instance.status.phase == "Pending":
-                conditions = notebook_pod.instance.status.conditions or []
+            pod.get()  # Refresh pod state
+            if pod.instance.status.phase == "Pending":
+                conditions = pod.instance.status.conditions or []
                 if any(c.type == "PodScheduled" and c.reason == "SchedulingGated" for c in conditions):
                     break
             time.sleep(1)  # noqa: FCN001
 
-        # Check that the pod is gated due to insufficient resources
-        running_pods, gated_pods = check_gated_pods_and_running_pods(
-            labels=pod_labels, namespace=kueue_enabled_notebook_namespace.name, admin_client=admin_client
-        )
-
-        # The pod should be gated (not running) due to resource constraints
-        assert gated_pods == 1, f"Expected exactly 1 gated notebook pod due to resource starvation, found {gated_pods}"
-        assert running_pods == 0, f"Expected no running notebook pods due to resource constraints, found {running_pods}"
-
-        # Verify the pod phase and conditions
-        notebook_pod.get()  # Refresh pod state
-        pod_status = notebook_pod.instance.status
+    def _verify_scheduling_gated_condition(self, pod: Pod) -> None:
+        """Verify that pod has SchedulingGated condition."""
+        pod.get()  # Refresh pod state
+        pod_status = pod.instance.status
         assert pod_status.phase == "Pending", f"Pod should be in Pending state, got: {pod_status.phase}"
 
         # Check for SchedulingGated condition
@@ -393,11 +436,6 @@ class TestKueueNotebookController:
                     break
 
         assert scheduling_gated, "Pod should have SchedulingGated condition due to insufficient resources"
-
-        LOGGER.info(
-            f"SUCCESS: Notebook pod {notebook_pod.name} is properly gated due to insufficient resources "
-            f"in queue {LOW_RESOURCE_LOCAL_QUEUE_NAME}"
-        )
 
     def test_kueue_notebook_stop_start_workbench(
         self,
@@ -423,37 +461,37 @@ class TestKueueNotebookController:
         """
 
         # Skip this test for resource starvation scenario (needs running notebook)
-        if default_notebook.name == HIGH_DEMAND_NOTEBOOK_NAME:
+        if self._is_resource_starvation_scenario(default_notebook):
             pytest.skip("Skipping stop/start test for resource starvation scenario")
 
+        # Initial setup and verification
+        notebook_pod = self._setup_initial_notebook_state(
+            default_notebook, unprivileged_client, kueue_notebook_cluster_queue, kueue_notebook_local_queue
+        )
+
+        # Test stopping the workbench
+        self._test_workbench_stop_functionality(
+            default_notebook, notebook_pod, kueue_notebook_cluster_queue, kueue_notebook_local_queue
+        )
+
+        # Test starting the workbench
+        self._test_workbench_start_functionality(
+            default_notebook, unprivileged_client, kueue_notebook_cluster_queue, kueue_notebook_local_queue
+        )
+
+    def _setup_initial_notebook_state(
+        self, notebook: Notebook, client: DynamicClient, cluster_queue, local_queue
+    ) -> Pod:
+        """Set up and verify initial notebook state before stop/start testing."""
         # Verify that the notebook was created with Kueue labels
-        assert default_notebook.exists, "Notebook CR should be created successfully"
-        notebook_labels = default_notebook.instance.metadata.labels or {}
-        queue_name = notebook_labels.get("kueue.x-k8s.io/queue-name")
-        assert queue_name is not None, (
-            f"Notebook should have Kueue queue label. Available labels: {list(notebook_labels.keys())}"
-        )
-        assert queue_name == LOCAL_QUEUE_NAME, (
-            f"Notebook should have correct queue name: {LOCAL_QUEUE_NAME}, got: {queue_name}"
-        )
+        self._validate_notebook_kueue_labels(notebook, TestConfig.LOCAL_QUEUE_NAME)
 
         # Wait for the notebook pod to be created and running
-        notebook_pod = Pod(
-            client=unprivileged_client,
-            namespace=default_notebook.namespace,
-            name=f"{default_notebook.name}-0",
-        )
-
-        # Wait for the pod to be created and become ready
-        notebook_pod.wait(timeout=Timeout.TIMEOUT_2MIN)
+        notebook_pod = self._setup_and_wait_for_notebook_pod(notebook, client)
         assert notebook_pod.exists, f"Notebook pod {notebook_pod.name} should exist"
 
         # Verify that Kueue has applied management labels to the pod
-        notebook_pod_labels = notebook_pod.instance.metadata.labels or {}
-        assert notebook_pod_labels.get("kueue.x-k8s.io/managed") == "true", "Pod should be managed by Kueue"
-        assert notebook_pod_labels.get("kueue.x-k8s.io/queue-name") == LOCAL_QUEUE_NAME, (
-            "Pod should reference correct queue"
-        )
+        self._validate_pod_kueue_management(notebook_pod, TestConfig.LOCAL_QUEUE_NAME)
 
         # Wait for the notebook pod to become ready (initial startup)
         notebook_pod.wait_for_condition(
@@ -464,130 +502,78 @@ class TestKueueNotebookController:
 
         # Verify Kueue is tracking exact resource usage for the running workload
         LOGGER.info("Checking queue resource usage before stopping workbench...")
-        initial_cluster_usage = get_queue_resource_usage(
-            queue=kueue_notebook_cluster_queue, flavor_name=RESOURCE_FLAVOR_NAME
-        )
-        initial_local_usage = get_queue_resource_usage(
-            queue=kueue_notebook_local_queue, flavor_name=RESOURCE_FLAVOR_NAME
-        )
-
-        LOGGER.info(f"Initial ClusterQueue usage: {initial_cluster_usage}")
-        LOGGER.info(f"Initial LocalQueue usage: {initial_local_usage}")
-
-        # For normal_resources scenario:
-        # - Main notebook container: cpu="1", memory="1Gi"
-        # - OAuth proxy sidecar: cpu="100m", memory="64Mi"
-        # - Total: cpu="1100m", memory="1088Mi"
-        expected_cpu = "1100m"
-        expected_memory = "1088Mi"
-
-        # Verify that Kueue is actively tracking the exact expected resource usage
-        cluster_tracks_exact = verify_queue_tracks_workload(
-            queue=kueue_notebook_cluster_queue,
-            flavor_name=RESOURCE_FLAVOR_NAME,
-            expected_cpu=expected_cpu,
-            expected_memory=expected_memory,
-        )
-        local_tracks_exact = verify_queue_tracks_workload(
-            queue=kueue_notebook_local_queue,
-            flavor_name=RESOURCE_FLAVOR_NAME,
-            expected_cpu=expected_cpu,
-            expected_memory=expected_memory,
+        self._verify_resource_tracking(
+            cluster_queue=cluster_queue,
+            local_queue=local_queue,
+            flavor_name=TestConfig.RESOURCE_FLAVOR_NAME,
+            expected_cpu=TestConfig.EXPECTED_CPU_NORMAL,
+            expected_memory=TestConfig.EXPECTED_MEMORY_NORMAL,
         )
 
-        assert cluster_tracks_exact or local_tracks_exact, (
-            f"Kueue should be tracking exact resource usage matching notebook requests "
-            f"(CPU: {expected_cpu}, Memory: {expected_memory}). "
-            f"ClusterQueue usage: {initial_cluster_usage}, LocalQueue usage: {initial_local_usage}"
-        )
+        return notebook_pod
 
-        # STEP 1: Stop the workbench by adding the kubeflow-resource-stopped annotation
+    def _test_workbench_stop_functionality(
+        self, notebook: Notebook, notebook_pod: Pod, cluster_queue, local_queue
+    ) -> None:
+        """Test stopping workbench and verify resource cleanup."""
+        # Stop the workbench by adding the kubeflow-resource-stopped annotation
         stop_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: FCN001
 
         # Get current notebook annotations
-        default_notebook.get()  # Refresh to get latest state
-        current_annotations = default_notebook.instance.metadata.annotations or {}
+        notebook.get()  # Refresh to get latest state
+        current_annotations = notebook.instance.metadata.annotations or {}
 
         # Add the stop annotation
         updated_annotations = {**current_annotations, "kubeflow-resource-stopped": stop_timestamp}
-
-        # Patch the notebook with the stop annotation
         stop_patch = {"metadata": {"annotations": updated_annotations}}
 
-        with ResourceEditor(patches={default_notebook: stop_patch}):
+        with ResourceEditor(patches={notebook: stop_patch}):
             LOGGER.info(f"Applied kubeflow-resource-stopped annotation with timestamp: {stop_timestamp}")
 
             # Wait for the pod to be terminated (it should be deleted)
             notebook_pod.wait_deleted(timeout=Timeout.TIMEOUT_2MIN)
-
             LOGGER.info(f"SUCCESS: Notebook pod {notebook_pod.name} was terminated after stop annotation")
 
             # Verify resource usage goes to zero after stopping workbench
             LOGGER.info("Checking queue resource usage after stopping workbench...")
-            stopped_cluster_usage = get_queue_resource_usage(
-                queue=kueue_notebook_cluster_queue, flavor_name=RESOURCE_FLAVOR_NAME
-            )
-            stopped_local_usage = get_queue_resource_usage(
-                queue=kueue_notebook_local_queue, flavor_name=RESOURCE_FLAVOR_NAME
-            )
-
-            LOGGER.info(f"Stopped ClusterQueue usage: {stopped_cluster_usage}")
-            LOGGER.info(f"Stopped LocalQueue usage: {stopped_local_usage}")
-
-            # Verify that resource usage is now zero (no workloads running)
-            cluster_zero_usage = verify_queue_tracks_workload(
-                queue=kueue_notebook_cluster_queue,
-                flavor_name=RESOURCE_FLAVOR_NAME,
-                expected_cpu="0",
-                expected_memory="0",
-            )
-            local_zero_usage = verify_queue_tracks_workload(
-                queue=kueue_notebook_local_queue,
-                flavor_name=RESOURCE_FLAVOR_NAME,
+            self._verify_resource_tracking(
+                cluster_queue=cluster_queue,
+                local_queue=local_queue,
+                flavor_name=TestConfig.RESOURCE_FLAVOR_NAME,
                 expected_cpu="0",
                 expected_memory="0",
             )
 
-            # At least one queue should show zero usage (the workload is stopped)
-            assert cluster_zero_usage or local_zero_usage, (
-                "After stopping workbench, either ClusterQueue or LocalQueue should show zero resource usage. "
-                f"ClusterQueue usage: {stopped_cluster_usage}, LocalQueue usage: {stopped_local_usage}"
-            )
-
-        # STEP 2: Start the workbench by removing the kubeflow-resource-stopped annotation
-        time.sleep(5)  # Brief pause before restart  # noqa: FCN001
+    def _test_workbench_start_functionality(
+        self, notebook: Notebook, client: DynamicClient, cluster_queue, local_queue
+    ) -> None:
+        """Test starting workbench and verify resource allocation."""
+        # Brief pause before restart
+        time.sleep(5)  # noqa: FCN001
 
         # Get current notebook annotations again
-        default_notebook.get()  # Refresh to get latest state
-        current_annotations = default_notebook.instance.metadata.annotations or {}
+        notebook.get()  # Refresh to get latest state
+        current_annotations = notebook.instance.metadata.annotations or {}
 
         # Remove the stop annotation
         restart_annotations = {k: v for k, v in current_annotations.items() if k != "kubeflow-resource-stopped"}
-
-        # Patch the notebook to remove the stop annotation
         restart_patch = {"metadata": {"annotations": restart_annotations}}
 
-        with ResourceEditor(patches={default_notebook: restart_patch}):
+        with ResourceEditor(patches={notebook: restart_patch}):
             LOGGER.info("Removed kubeflow-resource-stopped annotation to restart workbench")
 
-            # Wait for the new pod to be created (pod name should be the same)
+            # Wait for the new pod to be created
             new_notebook_pod = Pod(
-                client=unprivileged_client,
-                namespace=default_notebook.namespace,
-                name=f"{default_notebook.name}-0",
+                client=client,
+                namespace=notebook.namespace,
+                name=f"{notebook.name}-0",
             )
 
             new_notebook_pod.wait(timeout=Timeout.TIMEOUT_2MIN)
             assert new_notebook_pod.exists, f"New notebook pod {new_notebook_pod.name} should be created after restart"
 
             # Verify that Kueue management labels are still present on the new pod
-            new_notebook_pod_labels = new_notebook_pod.instance.metadata.labels or {}
-            assert new_notebook_pod_labels.get("kueue.x-k8s.io/managed") == "true", (
-                "Restarted pod should still be managed by Kueue"
-            )
-            assert new_notebook_pod_labels.get("kueue.x-k8s.io/queue-name") == LOCAL_QUEUE_NAME, (
-                "Restarted pod should still reference correct queue"
-            )
+            self._validate_pod_kueue_management(new_notebook_pod, TestConfig.LOCAL_QUEUE_NAME)
 
             # Wait for the new pod to become ready
             new_notebook_pod.wait_for_condition(
@@ -598,34 +584,12 @@ class TestKueueNotebookController:
 
             # Final verification: Ensure Kueue is tracking exact resource usage for the restarted workload
             LOGGER.info("Checking queue resource usage after restarting workbench...")
-            restarted_cluster_usage = get_queue_resource_usage(
-                queue=kueue_notebook_cluster_queue, flavor_name=RESOURCE_FLAVOR_NAME
-            )
-            restarted_local_usage = get_queue_resource_usage(
-                queue=kueue_notebook_local_queue, flavor_name=RESOURCE_FLAVOR_NAME
-            )
-
-            LOGGER.info(f"Restarted ClusterQueue usage: {restarted_cluster_usage}")
-            LOGGER.info(f"Restarted LocalQueue usage: {restarted_local_usage}")
-
-            # Verify that Kueue is again tracking the exact expected resource usage
-            cluster_tracks_exact_restart = verify_queue_tracks_workload(
-                queue=kueue_notebook_cluster_queue,
-                flavor_name=RESOURCE_FLAVOR_NAME,
-                expected_cpu=expected_cpu,
-                expected_memory=expected_memory,
-            )
-            local_tracks_exact_restart = verify_queue_tracks_workload(
-                queue=kueue_notebook_local_queue,
-                flavor_name=RESOURCE_FLAVOR_NAME,
-                expected_cpu=expected_cpu,
-                expected_memory=expected_memory,
-            )
-
-            assert cluster_tracks_exact_restart or local_tracks_exact_restart, (
-                f"Kueue should be tracking exact resource usage for the restarted workload "
-                f"(CPU: {expected_cpu}, Memory: {expected_memory}). "
-                f"ClusterQueue usage: {restarted_cluster_usage}, LocalQueue usage: {restarted_local_usage}"
+            self._verify_resource_tracking(
+                cluster_queue=cluster_queue,
+                local_queue=local_queue,
+                flavor_name=TestConfig.RESOURCE_FLAVOR_NAME,
+                expected_cpu=TestConfig.EXPECTED_CPU_NORMAL,
+                expected_memory=TestConfig.EXPECTED_MEMORY_NORMAL,
             )
 
 
