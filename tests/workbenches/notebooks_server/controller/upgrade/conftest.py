@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 import structlog
 from kubernetes.dynamic import DynamicClient
+from ocp_resources.cluster_role_binding import ClusterRoleBinding
 from ocp_resources.config_map import ConfigMap
 from ocp_resources.namespace import Namespace
 from ocp_resources.notebook import Notebook
@@ -230,6 +231,82 @@ def upgrade_notebook_reference_grant(
         client=admin_client,
         name="notebook-httproute-access",
         namespace=upgrade_notebook_namespace.name,
+    )
+
+
+@pytest.fixture(scope="session")
+def auth_proxy_service(
+    admin_client: DynamicClient,
+    upgrade_notebook: Notebook,
+) -> Service:
+    """kube-rbac-proxy Service for the notebook."""
+    return Service(
+        client=admin_client,
+        name=f"{upgrade_notebook.name}-kube-rbac-proxy",
+        namespace=upgrade_notebook.namespace,
+    )
+
+
+@pytest.fixture(scope="session")
+def auth_proxy_configmap(
+    admin_client: DynamicClient,
+    upgrade_notebook: Notebook,
+) -> ConfigMap:
+    """kube-rbac-proxy ConfigMap for the notebook."""
+    return ConfigMap(
+        client=admin_client,
+        name=f"{upgrade_notebook.name}-kube-rbac-proxy-config",
+        namespace=upgrade_notebook.namespace,
+    )
+
+
+@pytest.fixture(scope="session")
+def auth_delegator_crb(
+    admin_client: DynamicClient,
+    upgrade_notebook: Notebook,
+) -> ClusterRoleBinding:
+    """auth-delegator ClusterRoleBinding for the notebook's kube-rbac-proxy."""
+    return ClusterRoleBinding(
+        client=admin_client,
+        name=f"{upgrade_notebook.name}-rbac-{upgrade_notebook.namespace}-auth-delegator",
+    )
+
+
+@pytest.fixture(scope="session")
+def stopped_auth_proxy_service(
+    admin_client: DynamicClient,
+    stopped_notebook: Notebook,
+) -> Service:
+    """kube-rbac-proxy Service for the stopped notebook."""
+    return Service(
+        client=admin_client,
+        name=f"{stopped_notebook.name}-kube-rbac-proxy",
+        namespace=stopped_notebook.namespace,
+    )
+
+
+@pytest.fixture(scope="session")
+def stopped_auth_proxy_configmap(
+    admin_client: DynamicClient,
+    stopped_notebook: Notebook,
+) -> ConfigMap:
+    """kube-rbac-proxy ConfigMap for the stopped notebook."""
+    return ConfigMap(
+        client=admin_client,
+        name=f"{stopped_notebook.name}-kube-rbac-proxy-config",
+        namespace=stopped_notebook.namespace,
+    )
+
+
+@pytest.fixture(scope="session")
+def stopped_auth_delegator_crb(
+    admin_client: DynamicClient,
+    stopped_notebook: Notebook,
+) -> ClusterRoleBinding:
+    """auth-delegator ClusterRoleBinding for the stopped notebook's kube-rbac-proxy."""
+    return ClusterRoleBinding(
+        client=admin_client,
+        name=f"{stopped_notebook.name}-rbac-{stopped_notebook.namespace}-auth-delegator",
     )
 
 
