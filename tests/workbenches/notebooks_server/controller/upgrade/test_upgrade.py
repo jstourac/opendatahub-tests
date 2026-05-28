@@ -2,11 +2,12 @@ import json
 from typing import Any
 
 import pytest
+from ocp_resources.config_map import ConfigMap
 from ocp_resources.notebook import Notebook
 from ocp_resources.pod import Pod
 from ocp_resources.service import Service
 
-from tests.workbenches.notebooks_server.controller.utils import StatefulSet
+from tests.workbenches.notebooks_server.controller.utils import CA_BUNDLE_CERT_KEY, StatefulSet
 
 
 @pytest.mark.usefixtures("capture_notebook_baseline")
@@ -26,6 +27,25 @@ class TestPreUpgradeNotebook:
         Then the notebook pod should exist and be in Ready state.
         """
         assert upgrade_notebook_pod.exists, f"Notebook pod '{upgrade_notebook_pod.name}' does not exist"
+
+    @pytest.mark.pre_upgrade
+    def test_ca_bundle_configmap_exists_before_upgrade(
+        self,
+        workbench_trusted_ca_bundle: ConfigMap,
+    ) -> None:
+        """Given a notebook is running before upgrade,
+        When the ODH controller reconciles CA certificates,
+        Then the workbench-trusted-ca-bundle ConfigMap should exist with ca-bundle.crt.
+        """
+        assert workbench_trusted_ca_bundle.exists, (
+            f"ConfigMap '{workbench_trusted_ca_bundle.name}' not found in namespace "
+            f"'{workbench_trusted_ca_bundle.namespace}'"
+        )
+
+        cm_data = workbench_trusted_ca_bundle.instance.data
+        assert cm_data and cm_data.get(CA_BUNDLE_CERT_KEY) is not None, (
+            f"ConfigMap '{workbench_trusted_ca_bundle.name}' missing key '{CA_BUNDLE_CERT_KEY}'."
+        )
 
 
 class TestPostUpgradeNotebook:
@@ -155,4 +175,44 @@ class TestPostUpgradeNotebook:
             f"Service selector was modified during upgrade. "
             f"Pre-upgrade: {saved_selector}, "
             f"post-upgrade: {current_selector}"
+        )
+
+    @pytest.mark.post_upgrade
+    def test_ca_bundle_configmap_exists_after_upgrade(
+        self,
+        workbench_trusted_ca_bundle: ConfigMap,
+    ) -> None:
+        """Given the workbench-trusted-ca-bundle existed before upgrade,
+        When the upgrade completes,
+        Then the ConfigMap should still exist with the ca-bundle.crt key.
+        """
+        assert workbench_trusted_ca_bundle.exists, (
+            f"ConfigMap '{workbench_trusted_ca_bundle.name}' no longer exists after upgrade"
+        )
+
+        cm_data = workbench_trusted_ca_bundle.instance.data
+        assert cm_data and cm_data.get(CA_BUNDLE_CERT_KEY) is not None, (
+            f"ConfigMap '{workbench_trusted_ca_bundle.name}' lost '{CA_BUNDLE_CERT_KEY}' key after upgrade."
+        )
+
+    @pytest.mark.post_upgrade
+    def test_ca_bundle_configmap_not_modified_after_upgrade(
+        self,
+        workbench_trusted_ca_bundle: ConfigMap,
+        upgrade_notebook_baseline: dict[str, str],
+    ) -> None:
+        """Given the workbench-trusted-ca-bundle existed before upgrade,
+        When the upgrade completes,
+        Then its resourceVersion should be unchanged.
+        """
+        saved_resource_version = upgrade_notebook_baseline.get("ca_bundle_resource_version")
+        if not saved_resource_version:
+            pytest.skip("CA bundle baseline not captured (ConfigMap may not have existed pre-upgrade)")
+
+        current_resource_version = workbench_trusted_ca_bundle.instance.metadata.resourceVersion
+
+        assert current_resource_version == saved_resource_version, (
+            f"CA bundle ConfigMap was modified during upgrade. "
+            f"Pre-upgrade resourceVersion: {saved_resource_version}, "
+            f"post-upgrade resourceVersion: {current_resource_version}"
         )

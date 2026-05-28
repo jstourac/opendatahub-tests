@@ -16,6 +16,7 @@ from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError
 
 from tests.workbenches.notebooks_server.controller.utils import (
+    WORKBENCH_TRUSTED_CA_BUNDLE_NAME,
     StatefulSet,
     build_notebook_dict,
     resolve_notebook_image,
@@ -426,6 +427,19 @@ def stop_notebook_before_upgrade(
 
 
 @pytest.fixture(scope="session")
+def workbench_trusted_ca_bundle(
+    unprivileged_client: DynamicClient,
+    upgrade_notebook_namespace: Namespace,
+) -> ConfigMap:
+    """The workbench-trusted-ca-bundle ConfigMap created by the ODH controller."""
+    return ConfigMap(
+        client=unprivileged_client,
+        name=WORKBENCH_TRUSTED_CA_BUNDLE_NAME,
+        namespace=upgrade_notebook_namespace.name,
+    )
+
+
+@pytest.fixture(scope="session")
 def capture_notebook_baseline(
     pytestconfig: pytest.Config,
     admin_client: DynamicClient,
@@ -434,6 +448,7 @@ def capture_notebook_baseline(
     upgrade_notebook_statefulset: StatefulSet,
     upgrade_notebook_service: Service,
     upgrade_notebook_httproute: HTTPRoute,
+    workbench_trusted_ca_bundle: ConfigMap,
 ) -> None:
     """Capture notebook resource metadata to a ConfigMap before upgrade.
 
@@ -457,6 +472,10 @@ def capture_notebook_baseline(
     )
     httproute_generation = upgrade_notebook_httproute.instance.metadata.generation
 
+    ca_bundle_resource_version = ""
+    if workbench_trusted_ca_bundle.exists:
+        ca_bundle_resource_version = workbench_trusted_ca_bundle.instance.metadata.resourceVersion
+
     baseline = {
         "ntb_creation_timestamp": creation_timestamp,
         "notebook_generation": notebook_generation,
@@ -464,6 +483,7 @@ def capture_notebook_baseline(
         "service_ports": service_ports,
         "service_selector": service_selector,
         "httproute_generation": httproute_generation,
+        "ca_bundle_resource_version": ca_bundle_resource_version,
     }
 
     ConfigMap(
