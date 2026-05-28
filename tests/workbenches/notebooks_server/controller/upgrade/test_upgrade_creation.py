@@ -3,10 +3,11 @@ from ocp_resources.notebook import Notebook
 from ocp_resources.pod import Pod
 from ocp_resources.service import Service
 
-from tests.workbenches.notebooks_server.controller.utils import StatefulSet
+from tests.workbenches.notebooks_server.controller.utils import MutatingWebhookConfiguration, StatefulSet
 from utilities.resources.http_route import HTTPRoute
 
 KUBE_RBAC_PROXY_CONTAINER = "kube-rbac-proxy"
+EXPECTED_WEBHOOK_FAILURE_POLICY = "Fail"
 
 
 class TestPostUpgradeNotebookCreation:
@@ -104,4 +105,77 @@ class TestPostUpgradeNotebookCreation:
         assert stop_annotation != "odh-notebook-controller-lock", (
             f"Notebook '{new_notebook.name}' still has reconciliation lock "
             f"'odh-notebook-controller-lock' after pod reached Ready"
+        )
+
+
+class TestPostUpgradeWebhookAvailability:
+    """Verify the notebook mutating webhook is available after upgrade.
+
+    Steps:
+        1. Confirm the MutatingWebhookConfiguration resource exists.
+        2. Verify failurePolicy is 'Fail' (not degraded to 'Ignore').
+        3. Verify the webhook targets the correct resource (notebooks).
+    """
+
+    @pytest.mark.post_upgrade
+    def test_mutating_webhook_exists(
+        self,
+        notebook_mutating_webhook: MutatingWebhookConfiguration,
+    ) -> None:
+        """Given the platform was upgraded,
+        When the ODH notebook controller is deployed,
+        Then the MutatingWebhookConfiguration should exist.
+        """
+        assert notebook_mutating_webhook.exists, (
+            f"MutatingWebhookConfiguration '{notebook_mutating_webhook.name}' not found after upgrade"
+        )
+
+    @pytest.mark.post_upgrade
+    def test_mutating_webhook_failure_policy(
+        self,
+        notebook_mutating_webhook: MutatingWebhookConfiguration,
+    ) -> None:
+        """Given the webhook exists post-upgrade,
+        When checking its configuration,
+        Then failurePolicy should be 'Fail' to prevent unvalidated notebooks.
+        """
+        webhooks = notebook_mutating_webhook.instance.webhooks
+        assert webhooks, f"MutatingWebhookConfiguration '{notebook_mutating_webhook.name}' has no webhooks defined"
+
+        for webhook in webhooks:
+            failure_policy = webhook.failurePolicy
+            assert failure_policy == EXPECTED_WEBHOOK_FAILURE_POLICY, (
+                f"Webhook '{webhook.name}' has failurePolicy='{failure_policy}', "
+                f"expected '{EXPECTED_WEBHOOK_FAILURE_POLICY}'"
+            )
+
+    @pytest.mark.post_upgrade
+    def test_mutating_webhook_targets_notebooks(
+        self,
+        notebook_mutating_webhook: MutatingWebhookConfiguration,
+    ) -> None:
+        """Given the webhook exists post-upgrade,
+        When checking its rules,
+        Then it should target kubeflow.org notebooks for CREATE and UPDATE.
+        """
+        webhooks = notebook_mutating_webhook.instance.webhooks
+        assert webhooks, f"MutatingWebhookConfiguration '{notebook_mutating_webhook.name}' has no webhooks defined"
+
+        notebook_rules_found = False
+        for webhook in webhooks:
+            for rule in webhook.rules or []:
+                api_groups = list(rule.apiGroups or [])
+                resources = list(rule.resources or [])
+                operations = list(rule.operations or [])
+                if "kubeflow.org" in api_groups and "notebooks" in resources:
+                    notebook_rules_found = True
+                    assert "CREATE" in operations, (
+                        f"Webhook '{webhook.name}' targets notebooks but missing CREATE operation"
+                    )
+                    assert "UPDATE" in operations, (
+                        f"Webhook '{webhook.name}' targets notebooks but missing UPDATE operation"
+                    )
+
+        assert notebook_rules_found, (
+            f"No webhook rule found targeting 'kubeflow.org/notebooks' in '{notebook_mutating_webhook.name}'"
         )
