@@ -12,8 +12,10 @@ from ocp_resources.namespace import Namespace
 from ocp_resources.notebook import Notebook
 from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 from ocp_resources.pod import Pod
+from ocp_resources.route import Route
 from ocp_resources.service import Service
 from pytest_testconfig import config as py_config
+from semver import Version
 from timeout_sampler import TimeoutExpiredError
 
 from tests.workbenches.notebooks_server.controller.utils import (
@@ -26,7 +28,7 @@ from tests.workbenches.notebooks_server.controller.utils import (
 from utilities import constants
 from utilities.constants import Timeout
 from utilities.general import collect_pod_information
-from utilities.infra import create_ns
+from utilities.infra import create_ns, get_product_version
 from utilities.resources.http_route import HTTPRoute
 from utilities.resources.reference_grant import ReferenceGrant
 
@@ -526,6 +528,13 @@ def capture_notebook_baseline(
     )
     odh_ca_bundle_resource_version = odh_trusted_ca_bundle.instance.metadata.resourceVersion
 
+    source_version = get_product_version(admin_client=admin_client)
+
+    containers = upgrade_notebook_pod.instance.spec.containers
+    sidecar_names = {"oauth-proxy", "kube-rbac-proxy"}
+    main_container = next((container for container in containers if container.name not in sidecar_names), None)
+    notebook_image = main_container.image if main_container else ""
+
     baseline = {
         "ntb_creation_timestamp": creation_timestamp,
         "notebook_generation": notebook_generation,
@@ -536,6 +545,8 @@ def capture_notebook_baseline(
         "stopped_annotation_value": stopped_annotation,
         "ca_bundle_resource_version": ca_bundle_resource_version,
         "odh_ca_bundle_resource_version": odh_ca_bundle_resource_version,
+        "source_rhoai_version": str(source_version),
+        "notebook_image": notebook_image,
     }
 
     ConfigMap(
@@ -727,3 +738,167 @@ def new_notebook_auth_delegator_crb(
         client=admin_client,
         name=f"{new_notebook.name}-rbac-{new_notebook.namespace}-auth-delegator",
     )
+
+
+@pytest.fixture(scope="session")
+def source_rhoai_version(
+    upgrade_notebook_baseline: dict[str, Any],
+) -> Version | None:
+    """The RHOAI version that was installed before the upgrade.
+
+    Returns None during pre-upgrade runs or if the baseline does not contain version info.
+    """
+    raw = upgrade_notebook_baseline.get("source_rhoai_version")
+    if not raw:
+        return None
+    return Version.parse(version=raw)
+
+
+@pytest.fixture(scope="session")
+def is_migration_from_2x(
+    source_rhoai_version: Version | None,
+) -> bool:
+    """Whether the upgrade is from RHOAI 2.x to 3.x (a major migration boundary)."""
+    if source_rhoai_version is None:
+        return False
+    return source_rhoai_version.major < 3
+
+
+@pytest.fixture(scope="session")
+def upgrade_notebook_route(
+    unprivileged_client: DynamicClient,
+    upgrade_notebook: Notebook,
+) -> Route:
+    """OpenShift Route for the running notebook (2.x-style routing)."""
+    return Route(
+        client=unprivileged_client,
+        name=upgrade_notebook.name,
+        namespace=upgrade_notebook.namespace,
+    )
+
+
+@pytest.fixture(scope="session")
+def stopped_notebook_route(
+    unprivileged_client: DynamicClient,
+    stopped_notebook: Notebook,
+) -> Route:
+    """OpenShift Route for the stopped notebook (2.x-style routing)."""
+    return Route(
+        client=unprivileged_client,
+        name=stopped_notebook.name,
+        namespace=stopped_notebook.namespace,
+    )
+
+
+@pytest.fixture(scope="session")
+def restart_stopped_notebook(
+    pytestconfig: pytest.Config,
+    unprivileged_client: DynamicClient,
+    stopped_notebook: Notebook,
+) -> Pod:
+    """Restart the stopped notebook by removing the stop annotation and wait for Ready.
+
+    Used by migration tests to trigger the 2.x-to-3.x workbench migration.
+    """
+    assert pytestconfig.option.post_upgrade, "restart_stopped_notebook fixture is only valid during post-upgrade"
+
+    stopped_notebook.update({
+        "metadata": {
+            "name": stopped_notebook.name,
+            "annotations": {"kubeflow-resource-stopped": None},
+        }
+    })
+    LOGGER.info(f"Removed kubeflow-resource-stopped annotation from '{stopped_notebook.name}' to trigger restart")
+
+    notebook_pod = Pod(
+        client=unprivileged_client,
+        namespace=stopped_notebook.namespace,
+        name=f"{stopped_notebook.name}-0",
+    )
+
+    try:
+        notebook_pod.wait()
+        notebook_pod.wait_for_condition(
+            condition=Pod.Condition.READY,
+            status=Pod.Condition.Status.TRUE,
+            timeout=Timeout.TIMEOUT_5MIN,
+        )
+    except (TimeoutError, TimeoutExpiredError) as e:
+        if notebook_pod.exists:
+            collect_pod_information(notebook_pod)
+            raise AssertionError(
+                f"Stopped notebook pod '{stopped_notebook.name}-0' failed to reach Ready state "
+                f"after restart within {Timeout.TIMEOUT_5MIN} seconds.\nOriginal error: {e}"
+            ) from e
+
+        raise AssertionError(
+            f"Stopped notebook pod '{stopped_notebook.name}-0' was not created after restart.\nOriginal error: {e}"
+        ) from e
+
+    return notebook_pod
+
+
+@pytest.fixture(scope="session")
+def restart_running_notebook(
+    pytestconfig: pytest.Config,
+    unprivileged_client: DynamicClient,
+    upgrade_notebook: Notebook,
+) -> Pod:
+    """Restart the running notebook via stop-then-start annotation cycle.
+
+    Used by migration tests to trigger the 2.x-to-3.x workbench migration
+    for a notebook that was kept running during the upgrade.
+    """
+    assert pytestconfig.option.post_upgrade, "restart_running_notebook fixture is only valid during post-upgrade"
+
+    stop_timestamp = datetime.now(tz=UTC).strftime(format="%Y-%m-%dT%H:%M:%SZ")
+    upgrade_notebook.update({
+        "metadata": {
+            "name": upgrade_notebook.name,
+            "annotations": {"kubeflow-resource-stopped": stop_timestamp},
+        }
+    })
+    LOGGER.info(f"Stopped running notebook '{upgrade_notebook.name}' with timestamp '{stop_timestamp}'")
+
+    old_pod = Pod(
+        client=unprivileged_client,
+        namespace=upgrade_notebook.namespace,
+        name=f"{upgrade_notebook.name}-0",
+    )
+    old_pod.wait_deleted(timeout=Timeout.TIMEOUT_2MIN)
+    LOGGER.info(f"Pod '{old_pod.name}' terminated after stop annotation")
+
+    upgrade_notebook.update({
+        "metadata": {
+            "name": upgrade_notebook.name,
+            "annotations": {"kubeflow-resource-stopped": None},
+        }
+    })
+    LOGGER.info(f"Removed kubeflow-resource-stopped annotation from '{upgrade_notebook.name}' to trigger restart")
+
+    new_pod = Pod(
+        client=unprivileged_client,
+        namespace=upgrade_notebook.namespace,
+        name=f"{upgrade_notebook.name}-0",
+    )
+
+    try:
+        new_pod.wait()
+        new_pod.wait_for_condition(
+            condition=Pod.Condition.READY,
+            status=Pod.Condition.Status.TRUE,
+            timeout=Timeout.TIMEOUT_5MIN,
+        )
+    except (TimeoutError, TimeoutExpiredError) as e:
+        if new_pod.exists:
+            collect_pod_information(new_pod)
+            raise AssertionError(
+                f"Running notebook pod '{upgrade_notebook.name}-0' failed to reach Ready state "
+                f"after restart within {Timeout.TIMEOUT_5MIN} seconds.\nOriginal error: {e}"
+            ) from e
+
+        raise AssertionError(
+            f"Running notebook pod '{upgrade_notebook.name}-0' was not created after restart.\nOriginal error: {e}"
+        ) from e
+
+    return new_pod
