@@ -796,19 +796,24 @@ def restart_stopped_notebook(
     unprivileged_client: DynamicClient,
     stopped_notebook: Notebook,
 ) -> Pod:
-    """Restart the stopped notebook by removing the stop annotation and wait for Ready.
+    """Restart the stopped notebook with inject-auth migration and wait for Ready.
 
-    Used by migration tests to trigger the 2.x-to-3.x workbench migration.
+    Simulates the manual migration action: changes inject-oauth to inject-auth
+    and removes the stop annotation, triggering the 2.x-to-3.x workbench migration.
     """
     assert pytestconfig.option.post_upgrade, "restart_stopped_notebook fixture is only valid during post-upgrade"
 
     stopped_notebook.update({
         "metadata": {
             "name": stopped_notebook.name,
-            "annotations": {"kubeflow-resource-stopped": None},
+            "annotations": {
+                "kubeflow-resource-stopped": None,
+                "notebooks.opendatahub.io/inject-oauth": None,
+                "notebooks.opendatahub.io/inject-auth": "true",
+            },
         }
     })
-    LOGGER.info(f"Removed kubeflow-resource-stopped annotation from '{stopped_notebook.name}' to trigger restart")
+    LOGGER.info(f"Migrated '{stopped_notebook.name}': removed inject-oauth, added inject-auth, removed stop annotation")
 
     notebook_pod = Pod(
         client=unprivileged_client,
@@ -844,10 +849,10 @@ def restart_running_notebook(
     unprivileged_client: DynamicClient,
     upgrade_notebook: Notebook,
 ) -> Pod:
-    """Restart the running notebook via stop-then-start annotation cycle.
+    """Restart the running notebook with inject-auth migration via stop-then-start cycle.
 
-    Used by migration tests to trigger the 2.x-to-3.x workbench migration
-    for a notebook that was kept running during the upgrade.
+    Simulates the manual migration action: stops the notebook, changes inject-oauth
+    to inject-auth, then starts it, triggering the 2.x-to-3.x workbench migration.
     """
     assert pytestconfig.option.post_upgrade, "restart_running_notebook fixture is only valid during post-upgrade"
 
@@ -871,10 +876,14 @@ def restart_running_notebook(
     upgrade_notebook.update({
         "metadata": {
             "name": upgrade_notebook.name,
-            "annotations": {"kubeflow-resource-stopped": None},
+            "annotations": {
+                "kubeflow-resource-stopped": None,
+                "notebooks.opendatahub.io/inject-oauth": None,
+                "notebooks.opendatahub.io/inject-auth": "true",
+            },
         }
     })
-    LOGGER.info(f"Removed kubeflow-resource-stopped annotation from '{upgrade_notebook.name}' to trigger restart")
+    LOGGER.info(f"Migrated '{upgrade_notebook.name}': removed inject-oauth, added inject-auth, removed stop annotation")
 
     new_pod = Pod(
         client=unprivileged_client,
