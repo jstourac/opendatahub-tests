@@ -1,4 +1,5 @@
 import json
+import re
 from collections.abc import Generator
 from datetime import UTC, datetime
 from typing import Any
@@ -12,7 +13,9 @@ from ocp_resources.namespace import Namespace
 from ocp_resources.notebook import Notebook
 from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 from ocp_resources.pod import Pod
+from ocp_resources.resource import Resource
 from ocp_resources.route import Route
+from ocp_resources.secret import Secret
 from ocp_resources.service import Service
 from pytest_testconfig import config as py_config
 from semver import Version
@@ -21,6 +24,7 @@ from timeout_sampler import TimeoutExpiredError
 from tests.workbenches.notebooks_server.controller.utils import (
     WORKBENCH_TRUSTED_CA_BUNDLE_NAME,
     MutatingWebhookConfiguration,
+    OAuthClient,
     StatefulSet,
     build_notebook_dict,
     resolve_notebook_image,
@@ -41,6 +45,106 @@ NEW_NOTEBOOK_NAME = "upgrade-wb-new"
 NOTEBOOK_MUTATING_WEBHOOK_NAME = "odh-notebook-controller-mutating-webhook-configuration"
 UPGRADE_BASELINE_CM_NAME = "upgrade-workbenches-baseline"
 ODH_TRUSTED_CA_BUNDLE_NAME = "odh-trusted-ca-bundle"
+
+OAUTH_PROXY_CONTAINER = "oauth-proxy"
+OAUTH_FINALIZER = "notebook-oauth-client-finalizer.opendatahub.io"
+OAUTH_VOLUMES = frozenset({"oauth-config", "oauth-client", "tls-certificates"})
+TORNADO_SETTINGS_PATTERN = re.compile(pattern=r"\s*--ServerApp\.tornado_settings=[^\n]*")
+
+
+def migrate_notebook_to_3x(notebook: Notebook, client: DynamicClient) -> None:
+    """Patch a 2.x Notebook CR for the 3.x auth model.
+
+    Replicates the rhoai-upgrade-helpers `patch` command:
+    1. Add inject-auth annotation, remove inject-oauth and oauth-logout-url
+    2. Remove oauth-proxy container from spec
+    3. Remove oauth-related volumes (oauth-config, oauth-client, tls-certificates)
+    4. Remove notebook-oauth-client-finalizer finalizer
+    5. Strip --ServerApp.tornado_settings from NOTEBOOK_ARGS env var
+    6. Delete the StatefulSet to force recreation by the controller
+    """
+    spec = notebook.instance.spec.template.spec
+    containers = spec.containers or []
+    volumes = spec.volumes or []
+    finalizers = notebook.instance.metadata.finalizers or []
+
+    patched_containers = [c for c in containers if c.name != OAUTH_PROXY_CONTAINER]
+    patched_volumes = [v for v in volumes if v.name not in OAUTH_VOLUMES]
+    patched_finalizers = [f for f in finalizers if f != OAUTH_FINALIZER]
+
+    for container in patched_containers:
+        if not container.env:
+            continue
+        for env_var in container.env:
+            if env_var.name == "NOTEBOOK_ARGS" and env_var.value:
+                env_var.value = TORNADO_SETTINGS_PATTERN.sub(repl="", string=env_var.value)
+
+    annotations = dict(notebook.instance.metadata.annotations or {})
+    annotations.pop("notebooks.opendatahub.io/inject-oauth", None)
+    annotations.pop("notebooks.opendatahub.io/oauth-logout-url", None)
+    annotations["notebooks.opendatahub.io/inject-auth"] = "true"
+
+    notebook.update({
+        "metadata": {
+            "name": notebook.name,
+            "annotations": annotations,
+            "finalizers": patched_finalizers,
+        },
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [c.to_dict() for c in patched_containers],
+                    "volumes": [v.to_dict() for v in patched_volumes],
+                }
+            }
+        },
+    })
+    LOGGER.info(f"Patched Notebook CR '{notebook.name}' for 3.x auth model")
+
+    sts = StatefulSet(
+        client=client,
+        name=notebook.name,
+        namespace=notebook.namespace,
+    )
+    if sts.exists:
+        sts.delete(wait=True)
+        LOGGER.info(f"Deleted StatefulSet '{notebook.name}' to force recreation")
+
+
+def cleanup_legacy_oauth_resources(
+    notebook_name: str,
+    namespace: str,
+    client: DynamicClient,
+    admin_client: DynamicClient,
+) -> None:
+    """Remove leftover OAuth resources after migration.
+
+    Replicates the rhoai-upgrade-helpers `cleanup` command:
+    - Route: {name}
+    - Service: {name}-tls
+    - Secret: {name}-oauth-client, {name}-oauth-config, {name}-tls
+    - OAuthClient: {name}-{namespace}-oauth-client (cluster-scoped)
+    """
+    resources_to_delete: list[Resource] = [
+        Route(client=client, name=notebook_name, namespace=namespace),
+        Service(client=client, name=f"{notebook_name}-tls", namespace=namespace),
+        Secret(client=client, name=f"{notebook_name}-oauth-client", namespace=namespace),
+        Secret(client=client, name=f"{notebook_name}-oauth-config", namespace=namespace),
+        Secret(client=client, name=f"{notebook_name}-tls", namespace=namespace),
+    ]
+
+    for resource in resources_to_delete:
+        if resource.exists:
+            resource.delete(wait=True)
+            LOGGER.info(f"Deleted {resource.kind} '{resource.name}' in '{namespace}'")
+
+    oauth_client = OAuthClient(
+        client=admin_client,
+        name=f"{notebook_name}-{namespace}-oauth-client",
+    )
+    if oauth_client.exists:
+        oauth_client.delete(wait=True)
+        LOGGER.info(f"Deleted OAuthClient '{oauth_client.name}'")
 
 
 @pytest.fixture(scope="session")
@@ -765,6 +869,12 @@ def is_migration_from_2x(
 
 
 @pytest.fixture(scope="session")
+def self_migrate(pytestconfig: pytest.Config) -> bool:
+    """Whether tests should perform 2.x-to-3.x migration themselves."""
+    return pytestconfig.option.self_migrate
+
+
+@pytest.fixture(scope="session")
 def upgrade_notebook_route(
     unprivileged_client: DynamicClient,
     upgrade_notebook: Notebook,
@@ -794,26 +904,34 @@ def stopped_notebook_route(
 def restart_stopped_notebook(
     pytestconfig: pytest.Config,
     unprivileged_client: DynamicClient,
+    admin_client: DynamicClient,
     stopped_notebook: Notebook,
+    self_migrate: bool,
 ) -> Pod:
-    """Restart the stopped notebook with inject-auth migration and wait for Ready.
+    """Migrate and start the stopped notebook, returning the Ready pod.
 
-    Simulates the manual migration action: changes inject-oauth to inject-auth
-    and removes the stop annotation, triggering the 2.x-to-3.x workbench migration.
+    In self-migrate mode: patches Notebook CR (removes oauth-proxy, changes annotation),
+    deletes StatefulSet, cleans up legacy resources, then starts.
+    In external mode: assumes migration scripts already ran; just removes stop annotation.
     """
     assert pytestconfig.option.post_upgrade, "restart_stopped_notebook fixture is only valid during post-upgrade"
+
+    if self_migrate:
+        migrate_notebook_to_3x(notebook=stopped_notebook, client=unprivileged_client)
+        cleanup_legacy_oauth_resources(
+            notebook_name=stopped_notebook.name,
+            namespace=stopped_notebook.namespace,
+            client=unprivileged_client,
+            admin_client=admin_client,
+        )
 
     stopped_notebook.update({
         "metadata": {
             "name": stopped_notebook.name,
-            "annotations": {
-                "kubeflow-resource-stopped": None,
-                "notebooks.opendatahub.io/inject-oauth": None,
-                "notebooks.opendatahub.io/inject-auth": "true",
-            },
+            "annotations": {"kubeflow-resource-stopped": None},
         }
     })
-    LOGGER.info(f"Migrated '{stopped_notebook.name}': removed inject-oauth, added inject-auth, removed stop annotation")
+    LOGGER.info(f"Removed kubeflow-resource-stopped from '{stopped_notebook.name}' to start")
 
     notebook_pod = Pod(
         client=unprivileged_client,
@@ -847,43 +965,50 @@ def restart_stopped_notebook(
 def restart_running_notebook(
     pytestconfig: pytest.Config,
     unprivileged_client: DynamicClient,
+    admin_client: DynamicClient,
     upgrade_notebook: Notebook,
+    self_migrate: bool,
 ) -> Pod:
-    """Restart the running notebook with inject-auth migration via stop-then-start cycle.
+    """Migrate and restart the running notebook via stop-migrate-start cycle.
 
-    Simulates the manual migration action: stops the notebook, changes inject-oauth
-    to inject-auth, then starts it, triggering the 2.x-to-3.x workbench migration.
+    In self-migrate mode: stops the notebook, patches CR, cleans up legacy resources, then starts.
+    In external mode: assumes notebook was already stopped + patched by pipeline; just starts it.
     """
     assert pytestconfig.option.post_upgrade, "restart_running_notebook fixture is only valid during post-upgrade"
 
-    stop_timestamp = datetime.now(tz=UTC).strftime(format="%Y-%m-%dT%H:%M:%SZ")
+    if self_migrate:
+        stop_timestamp = datetime.now(tz=UTC).strftime(format="%Y-%m-%dT%H:%M:%SZ")
+        upgrade_notebook.update({
+            "metadata": {
+                "name": upgrade_notebook.name,
+                "annotations": {"kubeflow-resource-stopped": stop_timestamp},
+            }
+        })
+        LOGGER.info(f"Stopped running notebook '{upgrade_notebook.name}' with timestamp '{stop_timestamp}'")
+
+        old_pod = Pod(
+            client=unprivileged_client,
+            namespace=upgrade_notebook.namespace,
+            name=f"{upgrade_notebook.name}-0",
+        )
+        old_pod.wait_deleted(timeout=Timeout.TIMEOUT_2MIN)
+        LOGGER.info(f"Pod '{old_pod.name}' terminated after stop annotation")
+
+        migrate_notebook_to_3x(notebook=upgrade_notebook, client=unprivileged_client)
+        cleanup_legacy_oauth_resources(
+            notebook_name=upgrade_notebook.name,
+            namespace=upgrade_notebook.namespace,
+            client=unprivileged_client,
+            admin_client=admin_client,
+        )
+
     upgrade_notebook.update({
         "metadata": {
             "name": upgrade_notebook.name,
-            "annotations": {"kubeflow-resource-stopped": stop_timestamp},
+            "annotations": {"kubeflow-resource-stopped": None},
         }
     })
-    LOGGER.info(f"Stopped running notebook '{upgrade_notebook.name}' with timestamp '{stop_timestamp}'")
-
-    old_pod = Pod(
-        client=unprivileged_client,
-        namespace=upgrade_notebook.namespace,
-        name=f"{upgrade_notebook.name}-0",
-    )
-    old_pod.wait_deleted(timeout=Timeout.TIMEOUT_2MIN)
-    LOGGER.info(f"Pod '{old_pod.name}' terminated after stop annotation")
-
-    upgrade_notebook.update({
-        "metadata": {
-            "name": upgrade_notebook.name,
-            "annotations": {
-                "kubeflow-resource-stopped": None,
-                "notebooks.opendatahub.io/inject-oauth": None,
-                "notebooks.opendatahub.io/inject-auth": "true",
-            },
-        }
-    })
-    LOGGER.info(f"Migrated '{upgrade_notebook.name}': removed inject-oauth, added inject-auth, removed stop annotation")
+    LOGGER.info(f"Removed kubeflow-resource-stopped from '{upgrade_notebook.name}' to start")
 
     new_pod = Pod(
         client=unprivileged_client,
