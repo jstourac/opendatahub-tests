@@ -166,8 +166,9 @@ class TestPostUpgrade2xResourcesSurvival:
 
 
 class TestPostUpgradeStoppedNotebookMigration:
-    """Phase B: Verify stopped workbench migrates to 3.x when restarted after 2.x upgrade.
+    """Phase B: Verify stopped workbench migrates to 3.x after manual annotation change.
 
+    Migration requires changing inject-oauth to inject-auth (simulates Dashboard action).
     Only runs when upgrading from 2.x. Skipped for 3.x-to-3.y upgrades.
     Must run AFTER Phase A tests (enforced by fixture dependency on restart_stopped_notebook).
     """
@@ -183,7 +184,7 @@ class TestPostUpgradeStoppedNotebookMigration:
         self,
         restart_stopped_notebook: Pod,
     ) -> None:
-        """Given a stopped 2.x notebook is restarted after upgrade,
+        """Given a stopped 2.x notebook has inject-oauth changed to inject-auth,
         When the stop annotation is removed,
         Then the notebook pod should reach Ready state.
 
@@ -192,18 +193,16 @@ class TestPostUpgradeStoppedNotebookMigration:
         """
 
     @pytest.mark.post_upgrade
-    def test_stopped_notebook_route_removed_after_restart(
+    def test_stopped_notebook_route_removed_after_migration(
         self,
         restart_stopped_notebook: Pod,
         stopped_notebook_route: Route,
     ) -> None:
-        """Given a stopped 2.x notebook is restarted after upgrade,
-        When the controller migrates it to 3.x,
+        """Given a stopped 2.x notebook is migrated (inject-oauth -> inject-auth) and restarted,
+        When the controller reconciles with the new annotation,
         Then the old OpenShift Route should be removed.
         """
-        assert not stopped_notebook_route.exists, (
-            f"Route '{stopped_notebook_route.name}' still exists after migration restart"
-        )
+        assert not stopped_notebook_route.exists, f"Route '{stopped_notebook_route.name}' still exists after migration"
 
     @pytest.mark.post_upgrade
     def test_stopped_notebook_httproute_created_after_restart(
@@ -247,14 +246,14 @@ class TestPostUpgradeStoppedNotebookMigration:
         )
 
     @pytest.mark.post_upgrade
-    def test_stopped_notebook_inject_auth_annotation_after_restart(
+    def test_stopped_notebook_inject_auth_annotation_after_migration(
         self,
         restart_stopped_notebook: Pod,
         stopped_notebook: Notebook,
     ) -> None:
-        """Given a stopped 2.x notebook is restarted after upgrade,
-        When the controller migrates it to 3.x,
-        Then inject-auth should replace inject-oauth annotation.
+        """Given a stopped 2.x notebook is migrated (inject-oauth -> inject-auth) and restarted,
+        When the controller reconciles,
+        Then inject-auth should be present and inject-oauth removed.
         """
         annotations = stopped_notebook.instance.metadata.annotations or {}
         assert annotations.get(INJECT_AUTH_ANNOTATION) == "true", (
@@ -266,12 +265,12 @@ class TestPostUpgradeStoppedNotebookMigration:
         )
 
     @pytest.mark.post_upgrade
-    def test_stopped_notebook_kube_rbac_proxy_sidecar_after_restart(
+    def test_stopped_notebook_kube_rbac_proxy_sidecar_after_migration(
         self,
         restart_stopped_notebook: Pod,
     ) -> None:
-        """Given a stopped 2.x notebook is restarted after upgrade,
-        When the controller migrates it to 3.x,
+        """Given a stopped 2.x notebook is migrated (inject-oauth -> inject-auth) and restarted,
+        When the controller reconciles,
         Then the pod should have kube-rbac-proxy sidecar instead of oauth-proxy.
         """
         containers = restart_stopped_notebook.instance.spec.containers
@@ -318,8 +317,9 @@ class TestPostUpgradeStoppedNotebookMigration:
 
 
 class TestPostUpgradeRunningNotebookMigration:
-    """Phase B: Verify running workbench migrates to 3.x when restarted after 2.x upgrade.
+    """Phase B: Verify running workbench migrates to 3.x after manual annotation change.
 
+    Migration requires stop-start cycle with inject-oauth changed to inject-auth.
     Only runs when upgrading from 2.x. Skipped for 3.x-to-3.y upgrades.
     Must run AFTER Phase A tests (enforced by fixture dependency on restart_running_notebook).
     """
@@ -335,7 +335,7 @@ class TestPostUpgradeRunningNotebookMigration:
         self,
         restart_running_notebook: Pod,
     ) -> None:
-        """Given a running 2.x notebook is restarted after upgrade,
+        """Given a running 2.x notebook has inject-oauth changed to inject-auth,
         When the stop-then-start cycle completes,
         Then the new notebook pod should reach Ready state.
 
@@ -344,18 +344,16 @@ class TestPostUpgradeRunningNotebookMigration:
         """
 
     @pytest.mark.post_upgrade
-    def test_running_notebook_route_removed_after_restart(
+    def test_running_notebook_route_removed_after_migration(
         self,
         restart_running_notebook: Pod,
         upgrade_notebook_route: Route,
     ) -> None:
-        """Given a running 2.x notebook is restarted after upgrade,
-        When the controller migrates it to 3.x,
+        """Given a running 2.x notebook is migrated (inject-oauth -> inject-auth) and restarted,
+        When the controller reconciles with the new annotation,
         Then the old OpenShift Route should be removed.
         """
-        assert not upgrade_notebook_route.exists, (
-            f"Route '{upgrade_notebook_route.name}' still exists after migration restart"
-        )
+        assert not upgrade_notebook_route.exists, f"Route '{upgrade_notebook_route.name}' still exists after migration"
 
     @pytest.mark.post_upgrade
     def test_running_notebook_httproute_created_after_restart(
@@ -399,14 +397,14 @@ class TestPostUpgradeRunningNotebookMigration:
         )
 
     @pytest.mark.post_upgrade
-    def test_running_notebook_inject_auth_annotation_after_restart(
+    def test_running_notebook_inject_auth_annotation_after_migration(
         self,
         restart_running_notebook: Pod,
         upgrade_notebook: Notebook,
     ) -> None:
-        """Given a running 2.x notebook is restarted after upgrade,
-        When the controller migrates it to 3.x,
-        Then inject-auth should replace inject-oauth annotation.
+        """Given a running 2.x notebook is migrated (inject-oauth -> inject-auth) and restarted,
+        When the controller reconciles,
+        Then inject-auth should be present and inject-oauth removed.
         """
         annotations = upgrade_notebook.instance.metadata.annotations or {}
         assert annotations.get(INJECT_AUTH_ANNOTATION) == "true", (
@@ -418,12 +416,12 @@ class TestPostUpgradeRunningNotebookMigration:
         )
 
     @pytest.mark.post_upgrade
-    def test_running_notebook_kube_rbac_proxy_sidecar_after_restart(
+    def test_running_notebook_kube_rbac_proxy_sidecar_after_migration(
         self,
         restart_running_notebook: Pod,
     ) -> None:
-        """Given a running 2.x notebook is restarted after upgrade,
-        When the controller migrates it to 3.x,
+        """Given a running 2.x notebook is migrated (inject-oauth -> inject-auth) and restarted,
+        When the controller reconciles,
         Then the pod should have kube-rbac-proxy sidecar instead of oauth-proxy.
         """
         containers = restart_running_notebook.instance.spec.containers
