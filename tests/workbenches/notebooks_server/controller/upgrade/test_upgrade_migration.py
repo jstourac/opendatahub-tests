@@ -18,9 +18,10 @@ INJECT_AUTH_ANNOTATION = "notebooks.opendatahub.io/inject-auth"
 
 
 class TestPostUpgrade2xResourcesSurvival:
-    """Phase A: Verify 2.x workbench resources survived upgrade unchanged (before restart).
+    """Phase A: Verify 2.x workbench state after upgrade (before manual migration).
 
-    Only runs when upgrading from 2.x. Skipped for 3.x-to-3.y upgrades.
+    The 3.x controller keeps old 2.x resources (Route, oauth-proxy, inject-oauth) intact
+    but proactively creates HTTPRoutes for dual routing. Only runs for 2.x -> 3.x upgrades.
     """
 
     @pytest.fixture(autouse=True)
@@ -58,14 +59,14 @@ class TestPostUpgrade2xResourcesSurvival:
         )
 
     @pytest.mark.post_upgrade
-    def test_stopped_notebook_no_httproute_before_restart(
+    def test_stopped_notebook_httproute_created_after_upgrade(
         self,
         admin_client: Any,
         stopped_notebook: Notebook,
     ) -> None:
         """Given a stopped notebook was created on 2.x,
-        When the platform is upgraded to 3.x but the notebook is not restarted,
-        Then no HTTPRoute should exist for this notebook.
+        When the platform is upgraded to 3.x,
+        Then the controller proactively creates an HTTPRoute (dual routing with the old Route).
         """
         apps_ns = py_config["applications_namespace"]
         httproute_name = f"nb-{stopped_notebook.namespace}-{stopped_notebook.name}"
@@ -74,8 +75,8 @@ class TestPostUpgrade2xResourcesSurvival:
             name=httproute_name,
             namespace=apps_ns,
         )
-        assert not httproute.exists, (
-            f"HTTPRoute '{httproute_name}' unexpectedly exists in '{apps_ns}' for stopped 2.x notebook before restart"
+        assert httproute.exists, (
+            f"HTTPRoute '{httproute_name}' not found in '{apps_ns}' for stopped 2.x notebook after upgrade"
         )
 
     @pytest.mark.post_upgrade
@@ -143,14 +144,14 @@ class TestPostUpgrade2xResourcesSurvival:
         )
 
     @pytest.mark.post_upgrade
-    def test_running_notebook_no_httproute_before_restart(
+    def test_running_notebook_httproute_created_after_upgrade(
         self,
         admin_client: Any,
         upgrade_notebook: Notebook,
     ) -> None:
         """Given a running notebook was created on 2.x,
-        When the platform is upgraded to 3.x but the notebook is not restarted,
-        Then no HTTPRoute should exist for this notebook.
+        When the platform is upgraded to 3.x,
+        Then the controller proactively creates an HTTPRoute (dual routing with the old Route).
         """
         apps_ns = py_config["applications_namespace"]
         httproute_name = f"nb-{upgrade_notebook.namespace}-{upgrade_notebook.name}"
@@ -159,8 +160,8 @@ class TestPostUpgrade2xResourcesSurvival:
             name=httproute_name,
             namespace=apps_ns,
         )
-        assert not httproute.exists, (
-            f"HTTPRoute '{httproute_name}' unexpectedly exists in '{apps_ns}' for running 2.x notebook before restart"
+        assert httproute.exists, (
+            f"HTTPRoute '{httproute_name}' not found in '{apps_ns}' for running 2.x notebook after upgrade"
         )
 
 
