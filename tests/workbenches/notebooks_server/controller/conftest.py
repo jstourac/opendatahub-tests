@@ -186,6 +186,9 @@ def default_notebook(
     # Optional Auth annotations
     auth_annotations = request.param.get("auth_annotations", {})
 
+    # Optional custom resource requests/limits for the notebook container
+    custom_resources = request.param.get("resources")
+
     # Set the correct username
     username = get_username(client=admin_client)
     assert username, "Failed to determine username from the cluster"
@@ -195,6 +198,7 @@ def default_notebook(
         name=name,
         image_path=notebook_image,
         extra_annotations=auth_annotations or None,
+        resources=custom_resources,
     )
 
     with Notebook(client=unprivileged_client, kind_dict=notebook_dict) as nb:
