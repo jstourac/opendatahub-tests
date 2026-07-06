@@ -62,7 +62,6 @@ def prompt_injection_detector_isvc(
     teardown_resources: bool,
 ) -> Generator[InferenceService, Any, Any]:
     if pytestconfig.option.post_upgrade:
-        # During post-upgrade, reuse existing InferenceService
         isvc = InferenceService(
             client=admin_client,
             name="prompt-injection-detector",
@@ -74,7 +73,8 @@ def prompt_injection_detector_isvc(
             timeout=600,
         )
         yield isvc
-        isvc.clean_up()
+        if teardown_resources:
+            isvc.clean_up()
     else:
         # During pre-upgrade or normal tests, create new InferenceService
         with create_isvc(
@@ -119,7 +119,8 @@ def prompt_injection_detector_route(
             namespace=model_namespace.name,
         )
         yield route
-        route.clean_up()
+        if teardown_resources:
+            route.clean_up()
     else:
         # During pre-upgrade or normal tests, create new Route
         route = Route(
@@ -164,7 +165,8 @@ def hap_detector_isvc(
             timeout=600,
         )
         yield isvc
-        isvc.clean_up()
+        if teardown_resources:
+            isvc.clean_up()
     else:
         # During pre-upgrade or normal tests, create new InferenceService
         with create_isvc(
@@ -209,7 +211,8 @@ def hap_detector_route(
             namespace=model_namespace.name,
         )
         yield route
-        route.clean_up()
+        if teardown_resources:
+            route.clean_up()
     else:
         # During pre-upgrade or normal tests, create new Route
         route = Route(
@@ -263,7 +266,7 @@ def installed_tempo_operator(
 
         yield
 
-        if teardown_resources and not pytestconfig.option.post_upgrade:
+        if teardown_resources:
             uninstall_operator(
                 admin_client=admin_client,
                 name=package_name,
@@ -300,7 +303,8 @@ def tempo_stack(
             timeout=Timeout.TIMEOUT_10MIN,
         )
         yield tempo_cr
-        tempo_cr.clean_up()
+        if teardown_resources:
+            tempo_cr.clean_up()
     else:
         # During pre-upgrade or normal tests, create new TempoStack
         csv_prefix = "tempo-operator"
@@ -370,39 +374,42 @@ def installed_opentelemetry_operator(
 
     package_name = "opentelemetry-product"
 
-    opentelemetry_subscription = Subscription(client=admin_client, namespace=operator_ns.name, name=package_name)
-
-    if not opentelemetry_subscription.exists:
-        install_operator(
-            admin_client=admin_client,
-            target_namespaces=None,
-            name=package_name,
-            channel="stable",
-            source="redhat-operators",
-            operator_namespace=operator_ns.name,
-            timeout=Timeout.TIMEOUT_15MIN,
-            install_plan_approval="Automatic",
-            starting_csv="opentelemetry-operator.v0.140.0-1",
-        )
-
-        deployment = Deployment(
-            client=admin_client,
-            namespace=operator_ns.name,
-            name="opentelemetry-operator-controller-manager",
-            wait_for_resource=True,
-        )
-        deployment.wait_for_replicas()
-
+    if pytestconfig.option.post_upgrade:
+        # Post-upgrade: reuse existing operator
         yield
 
-        if teardown_resources and not pytestconfig.option.post_upgrade:
+        # Cleanup after post-upgrade tests
+        if teardown_resources:
             uninstall_operator(
                 admin_client=admin_client,
                 name=package_name,
-                operator_namespace=operator_ns.name,
+                operator_namespace=operator_namespace,
                 clean_up_namespace=False,
             )
     else:
+        # Pre-upgrade: install operator
+        opentelemetry_subscription = Subscription(client=admin_client, namespace=operator_ns.name, name=package_name)
+
+        if not opentelemetry_subscription.exists:
+            install_operator(
+                admin_client=admin_client,
+                target_namespaces=None,
+                name=package_name,
+                channel="stable",
+                source="redhat-operators",
+                operator_namespace=operator_ns.name,
+                timeout=Timeout.TIMEOUT_15MIN,
+                install_plan_approval="Automatic",
+            )
+
+            deployment = Deployment(
+                client=admin_client,
+                namespace=operator_ns.name,
+                name="opentelemetry-operator-controller-manager",
+                wait_for_resource=True,
+            )
+            deployment.wait_for_replicas()
+
         yield
 
 
@@ -435,7 +442,8 @@ def otel_collector(
             label_selector="app.kubernetes.io/component=opentelemetry-collector",
         )
         yield otel_cr
-        otel_cr.clean_up()
+        if teardown_resources:
+            otel_cr.clean_up()
     else:
         # During pre-upgrade or normal tests, create new OpenTelemetryCollector
         # Get the OTel Operator CSV
@@ -448,9 +456,12 @@ def otel_collector(
         # Extract OpenTelemetryCollector CR example from ALM examples
         alm_examples: list[dict[str, Any]] = otel_csv.get_alm_examples()
         otel_cr_dict: dict[str, Any] = next(
-            example
-            for example in alm_examples
-            if example["kind"] == "OpenTelemetryCollector" and example["apiVersion"] == "opentelemetry.io/v1beta1"
+            (
+                example
+                for example in alm_examples
+                if example["kind"] == "OpenTelemetryCollector" and example["apiVersion"] == "opentelemetry.io/v1beta1"
+            ),
+            None,
         )
 
         if not otel_cr_dict:
@@ -559,7 +570,8 @@ def minio_pvc_otel(
             client=admin_client,
         )
         yield pvc
-        pvc.clean_up()
+        if teardown_resources:
+            pvc.clean_up()
     else:
         # During pre-upgrade or normal tests, create new PVC
         pvc_kwargs = {
@@ -588,7 +600,8 @@ def minio_deployment_otel(
         )
         deployment.wait_for_replicas()
         yield deployment
-        deployment.clean_up()
+        if teardown_resources:
+            deployment.clean_up()
     else:
         # During pre-upgrade or normal tests, create new Deployment
         selector = {"matchLabels": {"app.kubernetes.io/name": "minio"}}
@@ -644,7 +657,8 @@ def minio_service_otel(
             namespace=model_namespace.name,
         )
         yield service
-        service.clean_up()
+        if teardown_resources:
+            service.clean_up()
     else:
         # During pre-upgrade or normal tests, create new Service
         ports = [
@@ -684,7 +698,8 @@ def minio_secret_otel(
             namespace=model_namespace.name,
         )
         yield secret
-        secret.clean_up()
+        if teardown_resources:
+            secret.clean_up()
     else:
         # During pre-upgrade or normal tests, create new Secret
         secret = Secret(
@@ -702,26 +717,6 @@ def minio_secret_otel(
         )
         secret.deploy()
         yield secret
-
-
-@pytest.fixture(scope="class")
-def otelcol_metrics_endpoint(admin_client: DynamicClient, model_namespace: Namespace):
-    """
-    Returns the metrics endpoint for the OpenTelemetryCollector by grepping the service name.
-    """
-
-    service = next(
-        Service.get(
-            client=admin_client,
-            namespace=model_namespace.name,
-            label_selector="app.kubernetes.io/component=opentelemetry-collector",
-        )
-    )
-
-    service_name = service.name
-
-    port = OTEL_EXPORTER_PORT
-    return f"http://{service_name}.{model_namespace.name}.svc.cluster.local:{port}"
 
 
 @pytest.fixture(scope="class")
